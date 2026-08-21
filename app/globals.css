@@ -1,0 +1,61 @@
+@import "tailwindcss";
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Playfair+Display:wght@600;700&display=swap");
+
+/*
+  Design tokens sourced directly from Build Framework §15 "Design System &
+  Visual Language". Values are copied exactly, not approximated or
+  reinterpreted — that section is a settled product decision, not a design
+  brief left open for this pass to reinvent.
+*/
+:root {
+  /* Brand */
+  --color-cocoa: #5c3a21;      /* primary — buttons, nav, brand elements */
+  --color-cream: #fff4e6;      /* secondary — backgrounds, cards */
+  --color-terracotta: #c76b45; /* accent — highlights, selected states */
+
+  /* Status */
+  --color-success: #2e7d32;
+  --color-warning: #ed6c02;
+  --color-error: #d32f2f;
+
+  /* Neutral */
+  --color-page-bg: #fafaf8;
+  --color-surface: #ffffff;
+  --color-text-primary: #242424;
+  --color-text-secondary: #666666;
+  --color-border: #e5e5e5;
+
+  /* Radius scale, §15.7 */
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+}
+
+@theme inline {
+  --color-cocoa: var(--color-cocoa);
+  --color-cream: var(--color-cream);
+  --color-terracotta: var(--color-terracotta);
+  --color-success: var(--color-success);
+  --color-warning: var(--color-warning);
+  --color-error: var(--color-error);
+  --color-page-bg: var(--color-page-bg);
+  --color-surface: var(--color-surface);
+  --color-text-primary: var(--color-text-primary);
+  --color-text-secondary: var(--color-text-secondary);
+  --color-border: var(--color-border);
+
+  --radius-sm: var(--radius-sm);
+  --radius-md: var(--radius-md);
+  --radius-lg: var(--radius-lg);
+
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Playfair Display", ui-serif, Georgia, serif;
+}
+
+/* No prefers-color-scheme override: the brand palette is fixed cream/cocoa
+   per §15, not intended to invert into a generic dark theme. */
+body {
+  background: var(--color-page-bg);
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+}

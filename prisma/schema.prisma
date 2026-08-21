@@ -1,0 +1,518 @@
+// ============================================================================
+// Smart Bakery Operations Automation System — Database Schema
+// Phase 1: Foundation
+//
+// Source of truth for conflicts: Business_Rules_and_Configuration_Decisions.docx
+// overrides Business Analysis / Business Problem Analysis / Solution Design /
+// System Architecture / Build Framework wherever they disagree.
+//
+// Design notes are inline as comments above the relevant model, explaining
+// *why* a structural choice was made where it is not obvious from the field
+// list alone. Read those before modifying a model.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// AUTH & USERS
+// ----------------------------------------------------------------------------
+
+enum AccountType {
+  CUSTOMER
+  ADMIN
+}
+
+// Customer accounts are optional (Rules doc §4: guest checkout is the default).
+// A User with accountType CUSTOMER may or may not exist for a given order —
+// see the Order model's nullable customerId. This table only exists for
+// people who chose to register.
+model User {
+  id            String      @id @default(cuid())
+  name          String
+  email         String      @unique
+  passwordHash  String
+  accountType   AccountType
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  customerProfile CustomerProfile?
+  adminProfile    AdminProfile?
+
+  @@index([accountType])
+}
+
+// Split from User because customer-specific fields (communication preference,
+// saved delivery info) have no meaning for an Admin account, and vice versa
+// for AdminProfile's permissions field. Keeping User thin avoids nullable
+// admin-only or customer-only columns on the same row.
+model CustomerProfile {
+  id                     String   @id @default(cuid())
+  userId                 String   @unique
+  user                   User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  phone                  String?
+  communicationPreference CommunicationChannel @default(EMAIL)
+  savedDeliveryAddress   String?
+  notes                  String?  // internal notes visible to admin only, not the customer
+  createdAt              DateTime @default(now())
+
+  orders                 Order[]
+}
+
+model AdminProfile {
+  id          String   @id @default(cuid())
+  userId      String   @unique
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role        String   @default("owner") // room for future roles (staff, manager) without a schema change
+  permissions Json?    // structured permission flags, kept flexible for Phase 2+ since only one owner role exists at launch
+  createdAt   DateTime @default(now())
+}
+
+enum CommunicationChannel {
+  EMAIL
+  SMS
+  BOTH
+}
+
+// ----------------------------------------------------------------------------
+// PRODUCTS & PRODUCTION RULES
+// ----------------------------------------------------------------------------
+
+enum ProductCategory {
+  CAKE
+  CUPCAKE
+  COOKIE
+  PASTRY
+  BREAD
+  SEASONAL
+  OTHER
+}
+
+// Production rules are split out from Product rather than inlined, because
+// the Rules doc treats "what the product is" (name, price, images) and
+// "what it costs the bakery to make" (production units, complexity, notice
+// period) as two different concerns owned by two different people in
+// practice — a listing edit shouldn't risk touching capacity math, and vice
+// versa. It also lets a future feature (seasonal pricing, A/B product copy)
+// change without touching the number the Capacity Engine depends on.
+model Product {
+  id              String          @id @default(cuid())
+  name            String
+  slug            String          @unique
+  description     String
+  category        ProductCategory
+  basePrice       Decimal         @db.Decimal(10, 2)
+  images          String[]        // storage URLs
+  isActive        Boolean         @default(true) // soft-disable without deleting order history references
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  productionRule  ProductionRule?
+  sizeOptions     ProductSizeOption[]
+  orderItems      OrderItem[]
+
+  @@index([category])
+}
+
+// A cake sold in 3 sizes has different prep time/production units per size
+// in real bakery operation, even though the Build Framework document mostly
+// discusses "the product's" production units as singular. Modeling size as
+// a modifier table (rather than duplicating the whole Product per size)
+// avoids that data duplication while still letting a size change the
+// workload calculation.
+model ProductSizeOption {
+  id                    String  @id @default(cuid())
+  productId             String
+  product               Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  label                 String  // e.g. "6-inch", "Serves 20"
+  priceModifier         Decimal @db.Decimal(10, 2) @default(0)
+  productionUnitModifier Int    @default(0) // added on top of the base ProductionRule.productionUnits
+
+  orderItems            OrderItem[]
+
+  @@index([productId])
+}
+
+enum ComplexityLevel {
+  LEVEL_1_STANDARD
+  LEVEL_2_MODERATE
+  LEVEL_3_COMPLEX
+}
+
+// Production Units are explicitly abstract workload scores per Rules doc §1
+// — not hours, not a fixed time measure. Owner-configurable per product.
+// complexityLevel drives the auto-accept vs admin-review split from Rules
+// doc §5, and is stored here as the *default* for a catalogue product; a
+// custom request calculates its own complexity independently (see
+// CustomRequest model) because a custom order has no fixed Product row.
+model ProductionRule {
+  id                 String          @id @default(cuid())
+  productId          String          @unique
+  product            Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  productionUnits    Int             // base workload score, before size/customization modifiers
+  preparationDays    Int             // standard lead time to produce, in days
+  complexityLevel    ComplexityLevel @default(LEVEL_1_STANDARD)
+  minimumNoticeDays  Int             // Rules doc: minimum notice before an order of this product can be accepted
+  updatedAt          DateTime        @updatedAt
+}
+
+// ----------------------------------------------------------------------------
+// CAPACITY MANAGEMENT
+// ----------------------------------------------------------------------------
+
+// Weekly capacity is the master constraint (Rules doc §2). This table holds
+// exactly one active row at a time in practice (enforced at the application
+// layer, not the DB, since the owner may want historical capacity settings
+// preserved rather than overwritten — effectiveFrom/effectiveTo supports that
+// without needing a schema change later).
+model CapacitySettings {
+  id                      String    @id @default(cuid())
+  maxWeeklyProductionUnits Int
+  productionBufferUnits   Int       // reserved, protected capacity per Rules doc §2/§6
+  minimumNoticeDaysDefault Int      // business-wide default; ProductionRule can override per product
+  maximumAdvanceBookingDays Int
+  effectiveFrom           DateTime  @default(now())
+  effectiveTo             DateTime? // null = currently active
+  createdAt               DateTime  @default(now())
+
+  dailyAllocations        DailyCapacityAllocation[]
+
+  @@index([effectiveFrom, effectiveTo])
+}
+
+enum Weekday {
+  SUNDAY
+  MONDAY
+  TUESDAY
+  WEDNESDAY
+  THURSDAY
+  FRIDAY
+  SATURDAY
+}
+
+// Deliberately NOT an independent limit. Rules doc §2 is explicit: daily
+// capacity is "the distribution of the weekly capacity across individual
+// operating days, not a separate or independent limit." This table is
+// therefore always validated at the application layer against its parent
+// CapacitySettings.maxWeeklyProductionUnits (allocations must sum to <= the
+// weekly max). Storing them together under one CapacitySettings row, rather
+// than as a freestanding table, keeps that relationship structurally
+// explicit rather than something application code has to remember to check
+// against a separate table with its own lifecycle.
+model DailyCapacityAllocation {
+  id                 String           @id @default(cuid())
+  capacitySettingsId String
+  capacitySettings   CapacitySettings @relation(fields: [capacitySettingsId], references: [id], onDelete: Cascade)
+  weekday            Weekday
+  allocatedUnits     Int
+  isClosed           Boolean          @default(false) // e.g. bakery closed Sundays
+
+  @@unique([capacitySettingsId, weekday])
+}
+
+// Ad hoc closures (holidays, one-off blocked dates) distinct from the
+// recurring weekday pattern above. A holiday should not require editing the
+// standing weekly allocation.
+model BlockedDate {
+  id        String   @id @default(cuid())
+  date      DateTime @db.Date
+  reason    String?
+  createdAt DateTime @default(now())
+
+  @@unique([date])
+}
+
+// ----------------------------------------------------------------------------
+// ORDERS
+// ----------------------------------------------------------------------------
+
+enum OrderType {
+  CATALOGUE
+  CUSTOM
+}
+
+enum FulfillmentMethod {
+  PICKUP
+  DELIVERY
+}
+
+// Deliberately separate from PaymentStatus and from LateCancellationRequest
+// status (see model below) per explicit product decision: an order can be
+// IN_PRODUCTION while a Late Cancellation Request sits in PENDING_REVIEW on
+// top of it. Folding these into one enum would make that state unrepresentable.
+enum OrderStatus {
+  RECEIVED
+  SCHEDULED
+  IN_PRODUCTION
+  READY
+  COMPLETED
+  CANCELLED
+}
+
+enum PaymentModel {
+  PAY_NOW
+  PAY_ON_FULFILLMENT
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  STUB_PENDING_GATEWAY // Pay Now orders before a real gateway is wired in — see Payment model below
+}
+
+// Order is a header record; line items live in OrderItem. A real bakery
+// order is frequently multi-product (a cake plus a dozen cupcakes for the
+// same event), and the source documents mostly describe "the order" as if
+// it maps 1:1 to one product, which does not hold up in practice and would
+// have made per-item production-unit accounting impossible.
+//
+// customerId is nullable because guest checkout is the default ordering
+// experience (Rules doc §4) — an order does not require a registered
+// customer. guestName/guestEmail/guestPhone capture contact details for
+// orders with no linked account; order tracking then works "using their
+// order reference" per the same section.
+model Order {
+  id                String            @id @default(cuid())
+  orderReference    String            @unique @default(cuid()) // customer-facing tracking code, stable even if internal id scheme changes
+
+  customerId        String?
+  customer          CustomerProfile?  @relation(fields: [customerId], references: [id])
+  guestName         String?
+  guestEmail        String?
+  guestPhone        String?
+
+  orderType         OrderType
+  status            OrderStatus       @default(RECEIVED)
+
+  fulfillmentMethod FulfillmentMethod
+  deliveryAddress   String?           // required only when fulfillmentMethod = DELIVERY, enforced at application layer
+  deliveryFee       Decimal?          @db.Decimal(10, 2)
+
+  paymentModel      PaymentModel
+  paymentStatus     PaymentStatus     @default(PENDING)
+
+  communicationChannel CommunicationChannel @default(EMAIL)
+
+  requestedDate     DateTime          @db.Date // date the customer originally asked for
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  items             OrderItem[]
+  schedule          ProductionSchedule?
+  payments          Payment[]
+  notifications     Notification[]
+  lateCancellationRequests LateCancellationRequest[]
+  modificationHistory OrderModification[]
+
+  @@index([customerId])
+  @@index([status])
+  @@index([requestedDate])
+}
+
+// Line item. totalProductionUnits is stored (not purely computed on read)
+// because it must be a stable, auditable number once an order is confirmed
+// — the Capacity Engine's historical math for a given week should not
+// silently change if a product's base production units are edited later.
+// It is calculated at order-creation time from Product/ProductSizeOption/
+// CustomRequest and then frozen.
+model OrderItem {
+  id                    String        @id @default(cuid())
+  orderId               String
+  order                 Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  productId             String?       // null for a fully custom item with no catalogue Product
+  product                Product?      @relation(fields: [productId], references: [id])
+  sizeOptionId           String?
+  sizeOption              ProductSizeOption? @relation(fields: [sizeOptionId], references: [id])
+  quantity               Int           @default(1)
+  unitPrice              Decimal       @db.Decimal(10, 2)
+
+  totalProductionUnits   Int           // frozen at order time, see model comment
+  complexityLevel        ComplexityLevel
+
+  customizationNotes     String?       // e.g. cake message, colour choice — for catalogue items with minor customization
+
+  customRequest          CustomRequest?
+
+  @@index([orderId])
+}
+
+// Only exists for items requiring the fully custom intake flow (Solution
+// Design's "Fully Custom Orders" path). Attached to OrderItem rather than
+// Order, since a single order can mix a catalogue cupcake dozen with one
+// custom cake — the custom intake fields belong to the specific item, not
+// the whole order.
+model CustomRequest {
+  id                     String   @id @default(cuid())
+  orderItemId            String   @unique
+  orderItem              OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+
+  eventType              String?
+  theme                  String?
+  description            String
+  inspirationImages      String[] // storage URLs
+  servingSize             Int?
+
+  estimatedComplexity    ComplexityLevel
+  estimatedProductionUnits Int
+
+  reviewStatus           CustomRequestReviewStatus @default(PENDING)
+  reviewedByAdminId      String?
+  reviewedAt             DateTime?
+  reviewNotes            String?
+
+  createdAt              DateTime @default(now())
+}
+
+enum CustomRequestReviewStatus {
+  PENDING           // awaiting evaluation
+  AUTO_APPROVED     // Level 1 or 2, no admin action needed — Rules doc §5
+  AWAITING_ADMIN    // Level 3, admin approval required before production
+  APPROVED
+  MODIFIED          // admin adjusted before approving
+  REJECTED
+}
+
+// Every accepted order gets a schedule row once it is assigned a production
+// slot — separate from Order itself because an order can exist in a
+// "reserved future period" state (Solution Design §"Advance Booking System")
+// before a concrete production date is locked in. Keeping this separate
+// avoids nullable date fields cluttering the Order model for orders that are
+// fully scheduled.
+model ProductionSchedule {
+  id                  String    @id @default(cuid())
+  orderId             String    @unique
+  order               Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  productionStartDate DateTime  @db.Date
+  productionEndDate   DateTime  @db.Date // = completion date, per Build Framework's Schedule Entity
+  pickupDate          DateTime? @db.Date
+  deliveryDate         DateTime? @db.Date
+
+  isFutureReservation Boolean   @default(false) // true = booked into a not-yet-open future capacity period
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  @@index([productionStartDate])
+}
+
+// ----------------------------------------------------------------------------
+// PAYMENTS
+// ----------------------------------------------------------------------------
+
+enum PaymentProvider {
+  STUB       // Phase 1 placeholder — Pay Now orders record intent without a live charge
+  STRIPE
+  SQUARE
+  PAYSTACK
+  CASH_ON_FULFILLMENT
+}
+
+// Modeled as its own table (not just a field on Order) so that the schema
+// does not change when a real gateway is wired in later — only the
+// provider logic writing to this table changes. Rules doc explicitly
+// requires the architecture support future gateway integration "without
+// requiring major architectural changes"; this is that seam.
+model Payment {
+  id         String          @id @default(cuid())
+  orderId    String
+  order      Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  provider   PaymentProvider
+  amount     Decimal         @db.Decimal(10, 2)
+  status     PaymentStatus
+  externalRef String?        // gateway transaction id, once a real provider exists
+  createdAt  DateTime        @default(now())
+
+  @@index([orderId])
+}
+
+// ----------------------------------------------------------------------------
+// MODIFICATION & CANCELLATION
+// ----------------------------------------------------------------------------
+
+// Rules doc §7: a modification that changes product/size/complexity is
+// re-evaluated as though it were a new order against the existing
+// fulfillment slot — not a free edit. This table is an audit trail of that
+// re-evaluation, not a live editable record.
+model OrderModification {
+  id              String   @id @default(cuid())
+  orderId         String
+  order           Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  requestedChange Json     // structured diff of what the customer asked to change
+  outcome         ModificationOutcome
+  newProductionUnits Int?  // recalculated total, if accepted
+  createdAt       DateTime @default(now())
+
+  @@index([orderId])
+}
+
+enum ModificationOutcome {
+  ACCEPTED
+  ALTERNATIVE_DATE_OFFERED
+  DECLINED
+}
+
+// Separate status enum from OrderStatus, per explicit product decision: an
+// order can be IN_PRODUCTION while its Late Cancellation Request sits in
+// PENDING_REVIEW. Collapsing these into one field would make that
+// simultaneous state impossible to represent, and Rules doc §7.1 requires
+// the order to "keep its current status" untouched while the request is
+// reviewed — this table's independence is what makes that possible.
+model LateCancellationRequest {
+  id              String                       @id @default(cuid())
+  orderId         String
+  order           Order                        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  status          LateCancellationStatus        @default(PENDING_REVIEW)
+  requestedAt     DateTime                     @default(now())
+  reviewedByAdminId String?
+  reviewedAt      DateTime?
+  adminDecisionNotes String?
+
+  @@index([orderId])
+  @@index([status])
+}
+
+enum LateCancellationStatus {
+  PENDING_REVIEW
+  APPROVED      // order.status becomes CANCELLED as a side effect, handled at application layer
+  REJECTED      // order continues in its existing status, untouched
+}
+
+// ----------------------------------------------------------------------------
+// COMMUNICATION
+// ----------------------------------------------------------------------------
+
+enum NotificationType {
+  ORDER_CONFIRMATION
+  PRODUCTION_UPDATE
+  PICKUP_REMINDER
+  DELIVERY_REMINDER
+  COMPLETION_MESSAGE
+  LATE_CANCELLATION_UPDATE
+}
+
+enum NotificationStatus {
+  QUEUED
+  SENT
+  FAILED
+}
+
+model Notification {
+  id          String              @id @default(cuid())
+  orderId     String
+  order       Order               @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  type        NotificationType
+  channel     CommunicationChannel
+  status      NotificationStatus  @default(QUEUED)
+  sentAt      DateTime?
+  createdAt   DateTime            @default(now())
+
+  @@index([orderId])
+  @@index([status])
+}
